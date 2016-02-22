@@ -272,9 +272,20 @@ struct HWCryptoHook_CallerContextValue {
  * BIGNUM's, so lets define a couple of conversion macros
  */
 #  define BN2MPI(mp, bn) \
-    {mp.size = bn->top * sizeof(BN_ULONG); mp.buf = (unsigned char *)bn->d;}
+    {mp.size = BN_num_bytes(bn); /* return value */ BN_bn2bin((bn), (mp).buf);}
 #  define MPI2BN(bn, mp) \
-    {mp.size = bn->dmax * sizeof(BN_ULONG); mp.buf = (unsigned char *)bn->d;}
+    {mp.size = BN_num_bytes(bn); /* return value */ BN_bn2bin((bn), (mp).buf);}
+
+/* Create a bignum with a copy of the Multi-precision Integer.  Caller
+   has to free the MPI buffer. */
+static void chil_bn2mpi(HWCryptoHook_MPI *mpi, const BIGNUM *bignum);
+static void chil_bn2mpi(HWCryptoHook_MPI *mpi, const BIGNUM *bignum)
+{
+  mpi->size = BN_bn2mpi(bignum, NULL);
+  mpi->buf = OPENSSL_malloc(mpi->size);
+  if (mpi->buf != NULL)
+    mpi->size = BN_bn2mpi(bignum, mpi->buf);
+}
 
 static BIO *logstream = NULL;
 static int disable_mutex_callbacks = 0;
@@ -461,8 +472,8 @@ static HWCryptoHook_ModExpCRT_t *p_hwcrhk_ModExpCRT = NULL;
 static const char *HWCRHK_LIBNAME = NULL;
 static void free_HWCRHK_LIBNAME(void)
 {
-    OPENSSL_free(HWCRHK_LIBNAME);
-    HWCRHK_LIBNAME = NULL;
+  OPENSSL_free((void *)HWCRHK_LIBNAME);
+  HWCRHK_LIBNAME = NULL;
 }
 
 static const char *get_HWCRHK_LIBNAME(void)
@@ -798,11 +809,13 @@ static EVP_PKEY *hwcrhk_load_privkey(ENGINE *eng, const char *key_id,
 #  ifndef OPENSSL_NO_RSA
     rtmp = RSA_new_method(eng);
     RSA_set_ex_data(rtmp, hndidx_rsa, (char *)hptr);
-    rtmp->e = BN_new();
-    rtmp->n = BN_new();
     rtmp->flags |= RSA_FLAG_EXT_PKEY;
-    MPI2BN(rtmp->e, e);
-    MPI2BN(rtmp->n, n);
+
+    /* preflight the public key extraction to get sizes */
+    e.size = 0;
+    e.buf = NULL;
+    n.size = 0;
+    n.buf = NULL;
     if (p_hwcrhk_RSAGetPublicKey(*hptr, &n, &e, &rmsg)
         != HWCRYPTOHOOK_ERROR_MPISIZE) {
         HWCRHKerr(HWCRHK_F_HWCRHK_LOAD_PRIVKEY, HWCRHK_R_CHIL_ERROR);
@@ -810,20 +823,28 @@ static EVP_PKEY *hwcrhk_load_privkey(ENGINE *eng, const char *key_id,
         goto err;
     }
 
-    bn_expand2(rtmp->e, e.size / sizeof(BN_ULONG));
-    bn_expand2(rtmp->n, n.size / sizeof(BN_ULONG));
-    MPI2BN(rtmp->e, e);
-    MPI2BN(rtmp->n, n);
-
+    e.buf = OPENSSL_malloc(e.size);
+    if (e.buf == NULL) {
+        HWCRHKerr(HWCRHK_F_HWCRHK_LOAD_PRIVKEY, ERR_R_MALLOC_FAILURE);
+        goto err;
+    }
+    n.buf = OPENSSL_malloc(n.size);
+    if (n.buf == NULL) {
+        HWCRHKerr(HWCRHK_F_HWCRHK_LOAD_PRIVKEY, ERR_R_MALLOC_FAILURE);
+        goto err;
+    }
     if (p_hwcrhk_RSAGetPublicKey(*hptr, &n, &e, &rmsg)) {
         HWCRHKerr(HWCRHK_F_HWCRHK_LOAD_PRIVKEY, HWCRHK_R_CHIL_ERROR);
         ERR_add_error_data(1, rmsg.buf);
         goto err;
     }
-    rtmp->e->top = e.size / sizeof(BN_ULONG);
-    bn_fix_top(rtmp->e);
-    rtmp->n->top = n.size / sizeof(BN_ULONG);
-    bn_fix_top(rtmp->n);
+
+    rtmp->e = BN_mpi2bn(e.buf, e.size, NULL);
+    rtmp->n = BN_mpi2bn(n.buf, n.size, NULL);
+    OPENSSL_free(e.buf);
+    e.buf = NULL;
+    OPENSSL_free(n.buf);
+    n.buf = NULL; 
 
     res = EVP_PKEY_new();
     if (res == NULL) {
@@ -841,6 +862,8 @@ static EVP_PKEY *hwcrhk_load_privkey(ENGINE *eng, const char *key_id,
  err:
 #  ifndef OPENSSL_NO_RSA
     RSA_free(rtmp);
+    OPENSSL_free(e.buf);
+    OPENSSL_free(n.buf);
 #  endif
     return NULL;
 }
@@ -849,27 +872,34 @@ static EVP_PKEY *hwcrhk_load_pubkey(ENGINE *eng, const char *key_id,
                                     UI_METHOD *ui_method, void *callback_data)
 {
     EVP_PKEY *res = NULL;
+    int pkey_type = 0;
+#  ifndef OPENSSL_NO_RSA
+    RSA *rsa = NULL, *rsa1 = NULL;
+#  endif
 
 #  ifndef OPENSSL_NO_RSA
     res = hwcrhk_load_privkey(eng, key_id, ui_method, callback_data);
 #  endif
 
     if (res)
-        switch (res->type) {
+      {
+	pkey_type = EVP_PKEY_id(res);
+        switch (pkey_type) {
 #  ifndef OPENSSL_NO_RSA
         case EVP_PKEY_RSA:
             {
-                RSA *rsa = NULL;
-
                 CRYPTO_w_lock(CRYPTO_LOCK_EVP_PKEY);
-                rsa = res->pkey.rsa;
-                res->pkey.rsa = RSA_new();
-                res->pkey.rsa->n = rsa->n;
-                res->pkey.rsa->e = rsa->e;
-                rsa->n = NULL;
-                rsa->e = NULL;
+                rsa = EVP_PKEY_get0_RSA(res);
+		rsa1 = RSA_new();
+		rsa1->n = rsa->n;
+		rsa1->e = rsa->e; 
+		if (EVP_PKEY_assign_RSA(res, rsa1) != 1)
+		  {
+		    HWCRHKerr(HWCRHK_F_HWCRHK_LOAD_PUBKEY,
+			      ERR_R_INTERNAL_ERROR);
+		    goto err;
+		  }
                 CRYPTO_w_unlock(CRYPTO_LOCK_EVP_PKEY);
-                RSA_free(rsa);
             }
             break;
 #  endif
@@ -878,10 +908,14 @@ static EVP_PKEY *hwcrhk_load_pubkey(ENGINE *eng, const char *key_id,
                       HWCRHK_R_CTRL_COMMAND_NOT_IMPLEMENTED);
             goto err;
         }
+      }
 
     return res;
  err:
     EVP_PKEY_free(res);
+#  ifndef OPENSSL_NO_RSA
+    RSA_free(rsa1);
+#  endif
     return NULL;
 }
 
@@ -907,19 +941,47 @@ static int hwcrhk_mod_exp(BIGNUM *r, const BIGNUM *a, const BIGNUM *p,
         HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, HWCRHK_R_NOT_INITIALISED);
         goto err;
     }
-    /* Prepare the params */
-    bn_expand2(r, m->top);      /* Check for error !! */
-    BN2MPI(m_a, a);
-    BN2MPI(m_p, p);
-    BN2MPI(m_n, m);
-    MPI2BN(r, m_r);
+    /* Prepare the params.  The base: */
+    m_a.size = BN_bn2mpi(a, NULL);
+    m_a.buf = OPENSSL_malloc(m_a.size);
+    if (m_a.buf == NULL)
+      {
+        HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, ERR_R_MALLOC_FAILURE);
+        goto err;
+    }
+    m_a.size = BN_bn2mpi(a, m_a.buf);
+    /* The exponent */
+    m_p.size = BN_bn2mpi(p, NULL);
+    m_p.buf = OPENSSL_malloc(m_p.size);
+    if (m_p.buf == NULL)
+      {
+        HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, ERR_R_MALLOC_FAILURE);
+        goto err;
+    }
+    m_p.size = BN_bn2mpi(p, m_p.buf);
+    /* The modulus */
+    m_n.size = BN_bn2mpi(m, NULL);
+    m_n.buf = OPENSSL_malloc(m_n.size);
+    if (m_n.buf == NULL)
+      {
+        HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, ERR_R_MALLOC_FAILURE);
+        goto err;
+    }
+    m_n.size = BN_bn2mpi(m, m_n.buf);
+    /* The result, same size as the modulus */
+    m_r.size = m_n.size;
+    m_r.buf = OPENSSL_malloc(m_r.size);
+    if (m_r.buf == NULL)
+      {
+        HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, ERR_R_MALLOC_FAILURE);
+        goto err;
+    }
 
     /* Perform the operation */
     ret = p_hwcrhk_ModExp(hwcrhk_context, m_a, m_p, m_n, &m_r, &rmsg);
 
     /* Convert the response */
-    r->top = m_r.size / sizeof(BN_ULONG);
-    bn_fix_top(r);
+    r = BN_mpi2bn(m_r.buf, m_r.size, r);
 
     if (ret < 0) {
         /*
@@ -972,18 +1034,36 @@ static int hwcrhk_rsa_mod_exp(BIGNUM *r, const BIGNUM *I, RSA *rsa,
                       HWCRHK_R_MISSING_KEY_COMPONENTS);
             goto err;
         }
-
-        /* Prepare the params */
-        bn_expand2(r, rsa->n->top); /* Check for error !! */
-        BN2MPI(m_a, I);
-        MPI2BN(r, m_r);
+	
+        /* Prepare the params: the message */
+	m_a.size = BN_bn2mpi(I, NULL);
+	m_a.buf = OPENSSL_malloc(m_a.size);
+	if (m_a.buf == NULL)
+	  {
+	    HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, ERR_R_MALLOC_FAILURE);
+	    goto err;
+	  }
+	m_a.size = BN_bn2mpi(I, m_a.buf);
+	
+	/* And the result */
+	m_r.size = RSA_size(rsa);
+	m_r.buf = OPENSSL_malloc(m_r.size);
+	if (m_r.buf == NULL)
+	  {
+	    HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, ERR_R_MALLOC_FAILURE);
+	    goto err;
+	  }
 
         /* Perform the operation */
         ret = p_hwcrhk_RSA(m_a, *hptr, &m_r, &rmsg);
 
         /* Convert the response */
-        r->top = m_r.size / sizeof(BN_ULONG);
-        bn_fix_top(r);
+	r = BN_mpi2bn(m_r.buf, m_r.size, r);
+
+	OPENSSL_free(m_a.buf);
+	OPENSSL_free(m_r.buf);
+	m_a.buf = NULL;
+	m_r.buf = NULL;
 
         if (ret < 0) {
             /*
@@ -1010,23 +1090,63 @@ static int hwcrhk_rsa_mod_exp(BIGNUM *r, const BIGNUM *I, RSA *rsa,
             goto err;
         }
 
-        /* Prepare the params */
-        bn_expand2(r, rsa->n->top); /* Check for error !! */
-        BN2MPI(m_a, I);
-        BN2MPI(m_p, rsa->p);
-        BN2MPI(m_q, rsa->q);
-        BN2MPI(m_dmp1, rsa->dmp1);
-        BN2MPI(m_dmq1, rsa->dmq1);
-        BN2MPI(m_iqmp, rsa->iqmp);
-        MPI2BN(r, m_r);
+        /* Prepare the params: the result */
+	m_r.size = RSA_size(rsa);
+	m_r.buf = OPENSSL_malloc(m_r.size);
+	if (m_r.buf == NULL)
+	  {
+	    HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, ERR_R_MALLOC_FAILURE);
+	    goto err;
+	  }
+	/* The base */
+	chil_bn2mpi(&m_a, I);
+	if (m_a.buf == NULL)
+	  {
+	    HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, ERR_R_MALLOC_FAILURE);
+	    goto err;
+	  }
+	/* p modulus larger factor */
+	chil_bn2mpi(&m_p, rsa->p);
+	if (m_p.buf == NULL)
+	  {
+	    HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, ERR_R_MALLOC_FAILURE);
+	    goto err;
+	  }
+	/* q modulus smaller factor */
+	chil_bn2mpi(&m_q, rsa->q);
+	if (m_q.buf == NULL)
+	  {
+	    HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, ERR_R_MALLOC_FAILURE);
+	    goto err;
+	  }
+	/* d mod p-1 */
+	chil_bn2mpi(&m_dmp1, rsa->dmp1);
+	if (m_dmp1.buf == NULL)
+	  {
+	    HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, ERR_R_MALLOC_FAILURE);
+	    goto err;
+	  }
+	/* d mod q-1 */
+	chil_bn2mpi(&m_dmq1, rsa->dmq1);
+	if (m_dmq1.buf == NULL)
+	  {
+	    HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, ERR_R_MALLOC_FAILURE);
+	    goto err;
+	  }
+	/* 1/q mod p */
+	chil_bn2mpi(&m_iqmp, rsa->iqmp);
+	if (m_iqmp.buf == NULL)
+	  {
+	    HWCRHKerr(HWCRHK_F_HWCRHK_MOD_EXP, ERR_R_MALLOC_FAILURE);
+	    goto err;
+	  }
 
         /* Perform the operation */
         ret = p_hwcrhk_ModExpCRT(hwcrhk_context, m_a, m_p, m_q,
                                  m_dmp1, m_dmq1, m_iqmp, &m_r, &rmsg);
 
         /* Convert the response */
-        r->top = m_r.size / sizeof(BN_ULONG);
-        bn_fix_top(r);
+	r = BN_mpi2bn(m_r.buf, m_r.size, r);
 
         if (ret < 0) {
             /*

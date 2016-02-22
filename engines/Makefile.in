@@ -25,12 +25,14 @@ AFLAGS= $(ASFLAGS)
 GENERAL=Makefile engines.com install.com engine_vector.mar
 
 LIB=$(TOP)/libcrypto.a
-LIBNAMES= padlock capi dasync
+LIBNAMES= chil padlock capi dasync
 LIBSRC=	\
+	e_chil.c \
 	e_padlock.c \
 	e_capi.c \
 	e_dasync.c
 LIBOBJ= \
+	e_chil.o \
 	e_padlock.o \
 	e_capi.o \
 	e_dasync.o \
